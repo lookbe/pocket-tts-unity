@@ -43,10 +43,16 @@ Open your project's `Packages/manifest.json` and update it to include the scoped
 
 ## Requirements: Models
 
-You must download the following two models separately:
+### A. ONNX ([KevinAHM/pocket-tts-onnx](https://huggingface.co/KevinAHM/pocket-tts-onnx/tree/main))
+* `mimi_encoder.onnx`
+* `mimi_decoder.onnx`
+* `text_conditioner.onnx`
+* `flow_lm_main.onnx`
+* `flow_lm_flow.onnx`
+* `tokenizer.model`
 
-1.  **Orpheus TTS (GGUF format):** e.g., [orpheus-3b-0.1-ft-Q4_K_M-GGUF](https://huggingface.co/isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF).
-2.  **SNAC Decoder (ONNX format):** You must use the exact `decoder_model.onnx` file from [snac_24khz-ONNX](https://huggingface.co/onnx-community/snac_24khz-ONNX/tree/main/onnx).
+### B. Predefined Voices ([KevinAHM/pocket-tts-web](https://huggingface.co/spaces/KevinAHM/pocket-tts-web/tree/main))
+* `voices.bin`
 
 ---
 
