@@ -15,6 +15,6 @@
     {
 	  "displayName": "Basic Pocket TTS",
 	  "description": "Shows the basic tts usage.",
-	  "path": "Samples~/BasicPocketTTS"
+	  "path": "Samples~/PocketTTS"
     }]
 }

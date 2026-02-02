@@ -34,9 +34,9 @@ namespace PocketTTS
             unityContext?.Post(_ => status = s, null);
         }
 
-        async void OnDestroy()
+        void OnDestroy()
         {
-            await BackgroundStop();
+            BackgroundStopSync();
             FreeModel();
         }
 
