@@ -157,7 +157,8 @@ namespace PocketTTS
             var latentFeedbackQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
             var bufferPool = new ConcurrentStack<float[]>();
             var noisePool = new ConcurrentStack<float[]>();
-            
+            var audioQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
+
             Func<int, float[]> getCondBuffer = (size) => bufferPool.TryPop(out var b) && b.Length >= size ? b : new float[size];
             Func<float[]> getNoiseBuffer = () => noisePool.TryPop(out var b) ? b : new float[32];
             
@@ -324,8 +325,34 @@ namespace PocketTTS
                                 Array.Copy(workerXData, refinedLatent, 32);
                                 latentFeedbackQueue.Add(refinedLatent);
 
-                                // 2. Decoding
-                                workerChunk.Add(refinedLatent);
+                                // 2. Queue for asynchronous decoding
+                                audioQueue.Add(refinedLatent);
+
+                                // Return buffers to pool
+                                returnCondBuffer(item.Conditioning);
+                                returnNoiseBuffer(item.Noise);
+                            }
+                        }
+                        finally
+                        {
+                            audioQueue.Add(null); // Signal EOF to decoder
+                            workerXHandle.Free();
+                        }
+                    }, cts);
+
+                    // Stage 3: Asynchronous Decoder Worker
+                    var decoderTask = Task.Run(() =>
+                    {
+                        var workerChunk = new List<float[]>();
+                        // Set decoder to high priority
+                        Thread.CurrentThread.Priority = System.Threading.ThreadPriority.AboveNormal;
+
+                        try
+                        {
+                            foreach (var latent in audioQueue.GetConsumingEnumerable(cts))
+                            {
+                                if (latent == null) break;
+                                workerChunk.Add(latent);
 
                                 if (workerChunk.Count >= AudioChunkSize)
                                 {
@@ -333,10 +360,6 @@ namespace PocketTTS
                                     PostResponse(audioChunk);
                                     workerChunk.Clear();
                                 }
-
-                                // Return buffers to pool
-                                returnCondBuffer(item.Conditioning);
-                                returnNoiseBuffer(item.Noise);
                             }
 
                             if (workerChunk.Count > 0)
@@ -345,10 +368,7 @@ namespace PocketTTS
                                 PostResponse(audioChunk);
                             }
                         }
-                        finally
-                        {
-                            workerXHandle.Free();
-                        }
+                        catch (Exception e) { Debug.LogError(e); }
                     }, cts);
 
                     // Stage 1: AR Generator (Producer)
@@ -397,7 +417,7 @@ namespace PocketTTS
                     }
 
                     synthQueue.Add(new SynthesisItem { IsFinal = true });
-                    synthTask.Wait(cts);
+                    Task.WaitAll(new[] { synthTask, decoderTask }, 10000);
                 }
             }
             catch (Exception e)
@@ -523,6 +543,8 @@ namespace PocketTTS
         private GCHandle _decoderFlattenHandle;
         private OrtValue _decoderLatentTensor;
         private Dictionary<string, OrtValue> _decoderInputs;
+        private List<int> _decoderStateOutputIndices;
+        private List<string> _decoderStateKeys;
 
         private float[] DecodeChunk(List<float[]> chunk, ref Dictionary<string, OrtValue> state, InferenceSession decoder)
         {
@@ -556,6 +578,19 @@ namespace PocketTTS
                 if (_decoderInputs == null)
                 {
                     _decoderInputs = new Dictionary<string, OrtValue>(state);
+                    
+                    // PRE-CALCULATE STATE MAPPINGS: Avoid string search/split in the hot loop
+                    _decoderStateOutputIndices = new List<int>();
+                    _decoderStateKeys = new List<string>();
+                    var outputNames = decoder.OutputNames;
+                    for (int i = 0; i < outputNames.Count; i++)
+                    {
+                        string name = outputNames[i];
+                        if (name.StartsWith("out_state_")) {
+                            _decoderStateOutputIndices.Add(i);
+                            _decoderStateKeys.Add("state_" + name.Replace("out_state_", ""));
+                        }
+                    }
                 }
                 else
                 {
@@ -563,11 +598,16 @@ namespace PocketTTS
                 }
                 _decoderInputs["latent"] = _decoderLatentTensor;
 
+                // Standard Run call (compatible with all versions)
                 using var res = decoder.Run(new RunOptions(), _decoderInputs, decoder.OutputNames);
-                var audioOutput = res[0];
-                ReadOnlySpan<float> audioSpan = audioOutput.GetTensorDataAsSpan<float>();
-                TensorUtil.UpdateState(state, res, decoder.OutputNames);
-                return audioSpan.ToArray();
+                
+                // Optimized Zero-Copy-ish State Update
+                for (int i = 0; i < _decoderStateOutputIndices.Count; i++)
+                {
+                    TensorUtil.CloneInto(res[_decoderStateOutputIndices[i]], state[_decoderStateKeys[i]]);
+                }
+                
+                return res[0].GetTensorDataAsSpan<float>().ToArray();
             }
             catch (Exception e)
             {
@@ -583,6 +623,8 @@ namespace PocketTTS
             _decoderLatentTensor = null;
             _decoderFlattenBuffer = null;
             _decoderInputs = null;
+            _decoderStateOutputIndices = null;
+            _decoderStateKeys = null;
         }
 
         #endregion
