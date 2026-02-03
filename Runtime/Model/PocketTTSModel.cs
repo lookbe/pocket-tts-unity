@@ -231,7 +231,7 @@ namespace PocketTTS
 
                 flowState = InitFlowLmState();
                 mimiState = InitMimiDecoderState();
-
+                
                 using var emptySeq = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 0, 32 });
                 using var emptyText = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 0, 1024 });
                 using var voiceTensor = OrtValue.CreateTensorValueFromMemory<float>(
