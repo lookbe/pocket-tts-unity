@@ -72,12 +72,13 @@ namespace PocketTTS
             {
                 _sentencePiece = new SentencePieceWrapper(tokenizerPath);
 
-                var opt = TensorUtil.GetMobileSessionOptions();
+                var lightOpt = TensorUtil.GetMobileSessionOptions(1); // One thread for fast stages
+                var mimiOpt = TensorUtil.GetMobileSessionOptions(2);  // Pin to the 2 Big Cores (A76) on G99
 
-                _textConditioner = new InferenceSession(textConditionerPath, opt);
-                _flowLmMain = new InferenceSession(flowLmMainPath, opt);
-                _flowLmFlow = new InferenceSession(flowLmFlowPath, opt);
-                _mimiDecoder = new InferenceSession(decoderPath, opt);
+                _textConditioner = new InferenceSession(textConditionerPath, lightOpt);
+                _flowLmMain = new InferenceSession(flowLmMainPath, lightOpt);
+                _flowLmFlow = new InferenceSession(flowLmFlowPath, lightOpt);
+                _mimiDecoder = new InferenceSession(decoderPath, mimiOpt);
 
                 PostStatus(ModelStatus.Ready);
             }
@@ -291,8 +292,8 @@ namespace PocketTTS
 
                         var workerChunk = new List<float[]>();
 
-                        // Set worker to highest priority to avoid hiccups
-                        Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
+                        // Set worker to AboveNormal (Mimi will be Highest)
+                        Thread.CurrentThread.Priority = System.Threading.ThreadPriority.AboveNormal;
 
                         try
                         {
@@ -358,8 +359,8 @@ namespace PocketTTS
                     var decoderTask = Task.Run(() =>
                     {
                         var workerChunk = new List<float[]>();
-                        // Set decoder to high priority
-                        Thread.CurrentThread.Priority = System.Threading.ThreadPriority.AboveNormal;
+                        // Set decoder to HIGHEST priority - it's the biggest bottleneck
+                        Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
 
                         try
                         {
@@ -597,6 +598,7 @@ namespace PocketTTS
         {
             try
             {
+                System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
                 int count = chunk.Count;
                 int size = count * 32;
 
@@ -626,7 +628,6 @@ namespace PocketTTS
                 {
                     _decoderInputs = new Dictionary<string, OrtValue>(state);
                     
-                    // PRE-CALCULATE STATE MAPPINGS: Avoid string search/split in the hot loop
                     _decoderStateOutputIndices = new List<int>();
                     _decoderStateKeys = new List<string>();
                     var outputNames = decoder.OutputNames;
@@ -639,20 +640,23 @@ namespace PocketTTS
                         }
                     }
                 }
-                else
-                {
-                    foreach (var kv in state) _decoderInputs[kv.Key] = kv.Value;
-                }
                 _decoderInputs["latent"] = _decoderLatentTensor;
+                long preMs = sw.ElapsedMilliseconds;
 
                 // Standard Run call (compatible with all versions)
+                sw.Restart();
                 using var res = decoder.Run(new RunOptions(), _decoderInputs, decoder.OutputNames);
+                long runMs = sw.ElapsedMilliseconds;
                 
                 // Optimized Zero-Copy-ish State Update
+                sw.Restart();
                 for (int i = 0; i < _decoderStateOutputIndices.Count; i++)
                 {
                     TensorUtil.CloneInto(res[_decoderStateOutputIndices[i]], state[_decoderStateKeys[i]]);
                 }
+                long mirrorMs = sw.ElapsedMilliseconds;
+
+                if (EnableProfiling) Debug.Log($"[Mimi Micro] Pre: {preMs}ms | Run: {runMs}ms | Mirror: {mirrorMs}ms");
                 
                 return res[0].GetTensorDataAsSpan<float>().ToArray();
             }

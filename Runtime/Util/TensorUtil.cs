@@ -145,13 +145,13 @@ namespace PocketTTS
             return OrtValue.CreateTensorValueFromMemory<long>(OrtMemoryInfo.DefaultInstance, values, shape);
         }
 
-        public static SessionOptions GetMobileSessionOptions()
+        public static SessionOptions GetMobileSessionOptions(int threadCount = 2)
         {
             var opt = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
-                IntraOpNumThreads = 2, // Balance for mobile
+                IntraOpNumThreads = threadCount,
                 InterOpNumThreads = 1
             };
             return opt;
