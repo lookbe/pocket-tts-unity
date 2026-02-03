@@ -31,7 +31,6 @@ Open your project's `Packages/manifest.json` and update it to include the scoped
   "dependencies": {
     "com.github.asus4.onnxruntime": "0.4.2",
     "com.github.asus4.onnxruntime.unity": "0.4.2",
-    "ai.lookbe.llamacpp": "https://github.com/lookbe/llama-cpp-unity.git",
     "ai.lookbe.pockettts": "https://github.com/lookbe/pocket-tts-unity.git",
 
     ... other dependencies
