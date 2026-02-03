@@ -72,8 +72,8 @@ namespace PocketTTS
             {
                 _sentencePiece = new SentencePieceWrapper(tokenizerPath);
 
-                var lightOpt = TensorUtil.GetMobileSessionOptions(1); // One thread for fast stages
-                var mimiOpt = TensorUtil.GetMobileSessionOptions(2);  // Pin to the 2 Big Cores (A76) on G99
+                using var lightOpt = TensorUtil.GetMobileSessionOptions(1); // One thread for fast stages
+                using var mimiOpt = TensorUtil.GetMobileSessionOptions(2);  // Pin to the 2 Big Cores (A76) on G99
 
                 _textConditioner = new InferenceSession(textConditionerPath, lightOpt);
                 _flowLmMain = new InferenceSession(flowLmMainPath, lightOpt);
@@ -156,12 +156,17 @@ namespace PocketTTS
             System.Random rand = new();
 
             // Pipelining: Synthesis Queue, Potential Buffer Pools, and Feedback
-            var synthQueue = new BlockingCollection<SynthesisItem>(new ConcurrentQueue<SynthesisItem>());
-            var latentFeedbackQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
+            using var synthQueue = new BlockingCollection<SynthesisItem>(new ConcurrentQueue<SynthesisItem>());
+            using var latentFeedbackQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
+            using var audioQueue = new BlockingCollection<KeyValuePair<int, float[]>>(new ConcurrentQueue<KeyValuePair<int, float[]>>());
+            
             var bufferPool = new ConcurrentStack<float[]>();
             var noisePool = new ConcurrentStack<float[]>();
-            var audioQueue = new BlockingCollection<KeyValuePair<int, float[]>>(new ConcurrentQueue<KeyValuePair<int, float[]>>());
 
+            // Clear previous session state
+            _decoderInputs = null; 
+            _decoderStateOutputIndices = null;
+            _decoderStateKeys = null;
             // Diagnostic accumulators
             long totalArMs = 0, totalFlowMs = 0, totalMimiMs = 0;
             int framesProcessed = 0;
@@ -279,6 +284,9 @@ namespace PocketTTS
 
                     // Initialize mainInputs once with persistent dictionary structure
                     // Since UpdateState uses CloneInto, the dictionary references stay valid.
+                    Exception synthException = null;
+                    Exception decoderException = null;
+
                     // Stage 2: Synthesis Worker (Pipelined)
                     var synthTask = Task.Run(() =>
                     {
@@ -348,10 +356,15 @@ namespace PocketTTS
                                 returnNoiseBuffer(item.Noise);
                             }
                         }
+                        catch (Exception e)
+                        {
+                            synthException = e;
+                            Debug.LogError($"[TTS Synth Error] {e}");
+                        }
                         finally
                         {
                             audioQueue.Add(new KeyValuePair<int, float[]>(0, null)); // Signal EOF to decoder
-                            workerXHandle.Free();
+                            if (workerXHandle.IsAllocated) workerXHandle.Free();
                         }
                     }, cts);
 
@@ -405,7 +418,11 @@ namespace PocketTTS
                                 PostResponse(audioChunk);
                             }
                         }
-                        catch (Exception e) { Debug.LogError(e); }
+                        catch (Exception e) 
+                        { 
+                            decoderException = e;
+                            Debug.LogError($"[TTS Decoder Error] {e}"); 
+                        }
                     }, cts);
 
                     // Stage 1: AR Generator (Producer)
@@ -466,11 +483,16 @@ namespace PocketTTS
 
                     synthQueue.Add(new SynthesisItem { IsFinal = true });
                     Task.WaitAll(new[] { synthTask, decoderTask }, 10000);
+
+                    if (synthException != null) throw synthException;
+                    if (decoderException != null) throw decoderException;
                 }
             }
             catch (Exception e)
             {
-                Debug.LogError(e);
+                Debug.LogError($"[TTS CRITICAL] {e}");
+                synthQueue.CompleteAdding();
+                audioQueue.CompleteAdding();
             }
             finally
             {
@@ -486,6 +508,10 @@ namespace PocketTTS
 
                 TensorUtil.DisposeState(flowState);
                 TensorUtil.DisposeState(mimiState);
+                
+                bufferPool.Clear();
+                noisePool.Clear();
+                frameBirthTimes.Clear();
 
                 PostStatus(ModelStatus.Ready);
             }
@@ -590,6 +616,7 @@ namespace PocketTTS
         private float[] _decoderFlattenBuffer;
         private GCHandle _decoderFlattenHandle;
         private OrtValue _decoderLatentTensor;
+        
         private Dictionary<string, OrtValue> _decoderInputs;
         private List<int> _decoderStateOutputIndices;
         private List<string> _decoderStateKeys;
@@ -626,6 +653,7 @@ namespace PocketTTS
 
                 if (_decoderInputs == null)
                 {
+                    // CRITICAL: Fresh dictionary and cache for this session
                     _decoderInputs = new Dictionary<string, OrtValue>(state);
                     
                     _decoderStateOutputIndices = new List<int>();
@@ -643,12 +671,10 @@ namespace PocketTTS
                 _decoderInputs["latent"] = _decoderLatentTensor;
                 long preMs = sw.ElapsedMilliseconds;
 
-                // Standard Run call (compatible with all versions)
                 sw.Restart();
                 using var res = decoder.Run(new RunOptions(), _decoderInputs, decoder.OutputNames);
                 long runMs = sw.ElapsedMilliseconds;
                 
-                // Optimized Zero-Copy-ish State Update
                 sw.Restart();
                 for (int i = 0; i < _decoderStateOutputIndices.Count; i++)
                 {
@@ -658,11 +684,13 @@ namespace PocketTTS
 
                 if (EnableProfiling) Debug.Log($"[Mimi Micro] Pre: {preMs}ms | Run: {runMs}ms | Mirror: {mirrorMs}ms");
                 
-                return res[0].GetTensorDataAsSpan<float>().ToArray();
+                // Optimized Audio extraction: Return COPY to avoid race condition
+                var data = res[0].GetTensorDataAsSpan<float>();
+                return data.ToArray();
             }
             catch (Exception e)
             {
-                Debug.LogError(e);
+                Debug.LogError($"[Mimi Error] {e}");
             }
             return new float[0];
         }
