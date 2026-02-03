@@ -54,8 +54,7 @@ namespace PocketTTS
         {
             try
             {
-                var opt = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
-                opt.IntraOpNumThreads = 4;
+                var opt = TensorUtil.GetMobileSessionOptions();
 
                 _mimiEncoder = new InferenceSession(encoderPath, opt);
 
