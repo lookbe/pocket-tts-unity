@@ -3,6 +3,7 @@ using PocketTts;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using UnityEngine;
@@ -148,6 +149,21 @@ namespace PocketTTS
             long[] currentLatentShape = { 1, 1, 32 };
             long[] xShape = { 1, 32 };
 
+            // Pre-generate Gaussian noise for the entire sequence to avoid Box-Muller in hot loop
+            int noiseCount = MaxFrames * 32; // 500 * 32
+            float[] noiseBuffer = new float[noiseCount];
+            for (int n = 0; n < noiseCount; n += 2)
+            {
+                double u1 = 1.0 - rand.NextDouble();
+                double u2 = 1.0 - rand.NextDouble();
+                double radius = Math.Sqrt(-2.0 * Math.Log(u1));
+                double theta = 2.0 * Math.PI * u2;
+                noiseBuffer[n] = (float)(radius * Math.Cos(theta));
+                if (n + 1 < noiseCount)
+                    noiseBuffer[n + 1] = (float)(radius * Math.Sin(theta));
+            }
+            float noiseStd = (float)Math.Sqrt(Temperature);
+
             // Persistent dictionaries for inputs to avoid per-step allocations
             Dictionary<string, OrtValue> mainInputs = null;
             Dictionary<string, OrtValue> flowInputs = null;
@@ -220,14 +236,18 @@ namespace PocketTTS
 
                     flowInputs = new Dictionary<string, OrtValue>();
 
+                    // Initialize mainInputs once with persistent dictionary structure
+                    // Since UpdateState uses CloneInto, the dictionary references stay valid.
+                    mainInputs = new Dictionary<string, OrtValue>(flowState);
+                    mainInputs["sequence"] = currentLatent;
+                    mainInputs["text_embeddings"] = emptyText;
+
                     for (int step = 0; step < MaxFrames; step++)
                     {
                         if (cts.IsCancellationRequested) break;
 
-                        // Zero-allocation: update mainInputs in-place
-                        foreach (var kv in flowState) mainInputs[kv.Key] = kv.Value;
-                        mainInputs["sequence"] = currentLatent;
-                        mainInputs["text_embeddings"] = emptyText;
+                        // No longer need to loop flowState -> mainInputs; CloneInto in UpdateState
+                        // already updated the native memory pointed to by the OrtValues in mainInputs.
 
                         using var arRes = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames);
 
@@ -235,13 +255,11 @@ namespace PocketTTS
                         if (eosStep < 0 && eos > EOS_THRESHOLD)
                             eosStep = step;
 
-                        double std = Math.Sqrt(Temperature);
+                        // Use pre-generated noise
+                        int noiseIdx = step * 32;
                         for (int i = 0; i < 32; i++)
                         {
-                            double u1 = 1.0 - rand.NextDouble();
-                            double u2 = 1.0 - rand.NextDouble();
-                            double randStdNormal = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2);
-                            xData[i] = (float)(randStdNormal * std);
+                            xData[i] = noiseBuffer[noiseIdx + i] * noiseStd;
                         }
 
                         float dt = 1.0f / DiffusionStep;
@@ -256,7 +274,27 @@ namespace PocketTTS
                             using var flowRes = _flowLmFlow.Run(new RunOptions(), flowInputs, _flowLmFlow.OutputNames);
 
                             var v = flowRes[0].GetTensorDataAsSpan<float>();
-                            for (int k = 0; k < 32; k++)
+                            
+                            // Vectorized integration using System.Numerics.Vector and MemoryMarshal.Cast
+                            int k = 0;
+                            if (Vector.IsHardwareAccelerated && (32 % Vector<float>.Count == 0))
+                            {
+                                int vectorSize = Vector<float>.Count;
+                                Vector<float> dtVec = new Vector<float>(dt);
+                                
+                                // Cast spans to Vector<float> for zero-allocation bitwise access
+                                var vVectors = MemoryMarshal.Cast<float, Vector<float>>(v);
+                                var xVectors = MemoryMarshal.Cast<float, Vector<float>>(xData.AsSpan());
+                                
+                                for (int vIdx = 0; vIdx < vVectors.Length; vIdx++)
+                                {
+                                    xVectors[vIdx] = xVectors[vIdx] + (vVectors[vIdx] * dtVec);
+                                }
+                                k = vVectors.Length * vectorSize;
+                            }
+                            
+                            // Fallback for remaining or non-vectorized
+                            for (; k < 32; k++)
                                 xData[k] += v[k] * dt;
                         }
 
