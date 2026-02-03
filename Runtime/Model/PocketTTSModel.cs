@@ -134,12 +134,14 @@ namespace PocketTTS
         public int DiffusionStep = 10;
         public int AudioChunkSize = 12;
         public float Temperature = 0.7f;
+        public bool EnableProfiling = true;
 
         const float EOS_THRESHOLD = -4f;
         const int FRAMES_AFTER_EOS = 3;
 
         private struct SynthesisItem
         {
+            public int Step;
             public float[] Conditioning;
             public float[] Noise;
             public bool IsFinal;
@@ -157,7 +159,17 @@ namespace PocketTTS
             var latentFeedbackQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
             var bufferPool = new ConcurrentStack<float[]>();
             var noisePool = new ConcurrentStack<float[]>();
-            var audioQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
+            var audioQueue = new BlockingCollection<KeyValuePair<int, float[]>>(new ConcurrentQueue<KeyValuePair<int, float[]>>());
+
+            // Diagnostic accumulators
+            long totalArMs = 0, totalFlowMs = 0, totalMimiMs = 0;
+            int framesProcessed = 0;
+
+            // Real-time analysis
+            var frameBirthTimes = new Dictionary<int, long>();
+            System.Diagnostics.Stopwatch lifeStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            System.Diagnostics.Stopwatch gapStopwatch = new();
+            gapStopwatch.Start();
 
             Func<int, float[]> getCondBuffer = (size) => bufferPool.TryPop(out var b) && b.Length >= size ? b : new float[size];
             Func<float[]> getNoiseBuffer = () => noisePool.TryPop(out var b) ? b : new float[32];
@@ -296,6 +308,7 @@ namespace PocketTTS
                                     OrtMemoryInfo.DefaultInstance, item.Conditioning, new long[] { 1, item.Conditioning.Length });
 
                                 workerFlowInputs["c"] = condTensor;
+                                System.Diagnostics.Stopwatch flowSw = System.Diagnostics.Stopwatch.StartNew();
                                 for (int j = 0; j < DiffusionStep; j++)
                                 {
                                     workerFlowInputs["s"] = stPairs[j].S;
@@ -319,6 +332,7 @@ namespace PocketTTS
                                     for (; k < 32; k++)
                                         workerXData[k] += v[k] * dt;
                                 }
+                                if (EnableProfiling) totalFlowMs += flowSw.ElapsedMilliseconds;
 
                                 // Pass REFINED latent back to producer for next AR step
                                 var refinedLatent = new float[32];
@@ -326,7 +340,7 @@ namespace PocketTTS
                                 latentFeedbackQueue.Add(refinedLatent);
 
                                 // 2. Queue for asynchronous decoding
-                                audioQueue.Add(refinedLatent);
+                                audioQueue.Add(new KeyValuePair<int, float[]>(item.Step, refinedLatent));
 
                                 // Return buffers to pool
                                 returnCondBuffer(item.Conditioning);
@@ -335,7 +349,7 @@ namespace PocketTTS
                         }
                         finally
                         {
-                            audioQueue.Add(null); // Signal EOF to decoder
+                            audioQueue.Add(new KeyValuePair<int, float[]>(0, null)); // Signal EOF to decoder
                             workerXHandle.Free();
                         }
                     }, cts);
@@ -349,15 +363,37 @@ namespace PocketTTS
 
                         try
                         {
-                            foreach (var latent in audioQueue.GetConsumingEnumerable(cts))
+                            foreach (var item in audioQueue.GetConsumingEnumerable(cts))
                             {
-                                if (latent == null) break;
-                                workerChunk.Add(latent);
+                                if (item.Value == null) break;
+                                workerChunk.Add(item.Value);
 
                                 if (workerChunk.Count >= AudioChunkSize)
                                 {
+                                    System.Diagnostics.Stopwatch mimiSw = System.Diagnostics.Stopwatch.StartNew();
                                     float[] audioChunk = DecodeChunk(workerChunk, ref mimiState, _mimiDecoder);
+                                    if (EnableProfiling) {
+                                        long now = lifeStopwatch.ElapsedMilliseconds;
+                                        totalMimiMs += mimiSw.ElapsedMilliseconds;
+                                        long gap = gapStopwatch.ElapsedMilliseconds;
+                                        
+                                        // RELIABLE MATH: Use actual sample count from the decoder
+                                        float producedMs = (audioChunk.Length / 24000.0f) * 1000.0f;
+                                        float rtRatio = producedMs / gap;
+
+                                        // End-to-end latency for this chunk (from birth of first frame in chunk)
+                                        long firstFrameBirth = frameBirthTimes.TryGetValue(item.Key - (AudioChunkSize - 1), out var b) ? b : 0;
+                                        long latency = now - firstFrameBirth;
+
+                                        string color = rtRatio >= 1.0f ? "cyan" : "red";
+                                        string status = rtRatio >= 1.0f ? "HEALTHY" : "LAGGING";
+                                        
+                                        Debug.Log($"<color={color}>[TTS RT] Ratio: {rtRatio:F2}x ({status}) | Produced: {producedMs:F0}ms | Gap: {gap}ms | Latency: {latency}ms</color>");
+                                        if (gap > producedMs + 5) Debug.Log($"<color=orange>[TTS GAP] Stutter detected! Gap ({gap}ms) > Audio ({producedMs:F0}ms)</color>");
+                                    }
+
                                     PostResponse(audioChunk);
+                                    gapStopwatch.Restart();
                                     workerChunk.Clear();
                                 }
                             }
@@ -380,7 +416,9 @@ namespace PocketTTS
                     {
                         if (cts.IsCancellationRequested) break;
 
+                        System.Diagnostics.Stopwatch arSw = System.Diagnostics.Stopwatch.StartNew();
                         using var arRes = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames);
+                        if (EnableProfiling) totalArMs += arSw.ElapsedMilliseconds;
 
                         var arOutputSpan = arRes[0].GetTensorDataAsSpan<float>();
                         if (step == 0) condDim = arOutputSpan.Length;
@@ -392,6 +430,7 @@ namespace PocketTTS
                         // Package conditioning and noise, then ship to worker
                         var synthItem = new SynthesisItem 
                         { 
+                            Step = step,
                             Conditioning = getCondBuffer(condDim), 
                             Noise = getNoiseBuffer(), 
                             IsFinal = false 
@@ -410,10 +449,18 @@ namespace PocketTTS
                             Array.Copy(refined, currentLatentData, 32);
                         }
 
+                        if (EnableProfiling) frameBirthTimes[step] = lifeStopwatch.ElapsedMilliseconds;
+
                         if (eosStep >= 0 && step >= eosStep + FRAMES_AFTER_EOS)
                             break;
 
                         TensorUtil.UpdateState(flowState, arRes, _flowLmMain.OutputNames);
+                        
+                        framesProcessed++;
+                        if (EnableProfiling && framesProcessed % 20 == 0)
+                        {
+                            Debug.Log($"[TTS Stats] AR: {totalArMs/framesProcessed}ms | Flow: {totalFlowMs/framesProcessed}ms | Mimi: {totalMimiMs/(framesProcessed/AudioChunkSize)}ms");
+                        }
                     }
 
                     synthQueue.Add(new SynthesisItem { IsFinal = true });
