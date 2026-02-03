@@ -36,7 +36,6 @@ namespace PocketTTS
         protected PocketTTSModel pocketTTS;
         protected PocketTTSVoices voices;
         protected MimiEncoder encoder;
-        protected MimiDecoder decoder;
         protected AudioSource audioSource;
 
         private Queue<float> audioQueue = new Queue<float>();
@@ -69,7 +68,6 @@ namespace PocketTTS
             pocketTTS = GetComponentInChildren<PocketTTSModel>();
             voices = GetComponentInChildren<PocketTTSVoices>();
             encoder = GetComponentInChildren<MimiEncoder>();
-            decoder = GetComponentInChildren<MimiDecoder>();
             audioSource = GetComponent<AudioSource>();
 
             audioSource.clip = AudioClip.Create("StreamingClip", SampleRate * 60, Channels, SampleRate, true, OnAudioRead);
@@ -81,7 +79,6 @@ namespace PocketTTS
         {
             pocketTTS.OnStatusChanged += OnModelStatusChanged;
             voices.OnStatusChanged += OnModelStatusChanged;
-            decoder.OnStatusChanged += OnModelStatusChanged;
             encoder.OnStatusChanged += OnModelStatusChanged;
 
             pocketTTS.OnResponseGenerated += OnResponseGenerated;
@@ -91,7 +88,6 @@ namespace PocketTTS
         {
             pocketTTS.OnStatusChanged -= OnModelStatusChanged;
             voices.OnStatusChanged -= OnModelStatusChanged;
-            decoder.OnStatusChanged -= OnModelStatusChanged;
             encoder.OnStatusChanged -= OnModelStatusChanged;
 
             pocketTTS.OnResponseGenerated -= OnResponseGenerated;
@@ -171,6 +167,7 @@ namespace PocketTTS
         {
             Debug.Log($"Load tts model");
 
+            pocketTTS.decoderPath = decoderPath;
             pocketTTS.tokenizerPath = tokenizerPath;
             pocketTTS.textConditionerPath = textConditionerPath;
             pocketTTS.flowLmMainPath = flowLmMainPath;
@@ -180,16 +177,12 @@ namespace PocketTTS
             encoder.encoderPath = encoderPath;
             encoder.InitModel();
 
-            decoder.decoderPath = decoderPath;
-            decoder.InitModel();
-
             voices.voicesBinPath = voicesBinPath;
             voices.voicesRefPath = voicesRefPath;
             voices.InitModel();
 
             yield return new WaitWhile(() => pocketTTS.status != ModelStatus.Ready);
             yield return new WaitWhile(() => encoder.status != ModelStatus.Ready);
-            yield return new WaitWhile(() => decoder.status != ModelStatus.Ready);
             yield return new WaitWhile(() => voices.status != ModelStatus.Ready);
 
             Debug.Log("Load model done");
@@ -219,7 +212,6 @@ namespace PocketTTS
             pocketTTS.PromptWithVoice(prompt, voices.GetVoice(voice.ToString()));
 
             yield return new WaitUntil(() => pocketTTS.status == ModelStatus.Ready);
-            yield return new WaitUntil(() => decoder.status == ModelStatus.Ready);
 
             // Wait for all audio samples to be played
             yield return new WaitUntil(() => audioQueue.Count == 0);

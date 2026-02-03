@@ -12,7 +12,6 @@ GameObject:
   - component: {fileID: 261048586492363987}
   - component: {fileID: 1947110370508409269}
   - component: {fileID: 3222290837311545704}
-  - component: {fileID: 537407064635215386}
   m_Layer: 0
   m_Name: Internal
   m_TagString: Untagged
@@ -47,14 +46,14 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6ce0d21096308bd47b8d90efcee47a54, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  decoder: {fileID: 537407064635215386}
   tokenizerPath: 
   textConditionerPath: 
   flowLmMainPath: 
   flowLmFlowPath: 
+  decoderPath: 
   MaxFrames: 500
-  DiffusionStep: 10
-  AudioChunkSize: 12
+  DiffusionStep: 8
+  AudioChunkSize: 8
   Temperature: 0.7
 --- !u!114 &1947110370508409269
 MonoBehaviour:
@@ -84,19 +83,6 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   encoderPath: 
---- !u!114 &537407064635215386
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 8497957668698899020}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: ed3917331df2847418c54ac4cea876f1, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  decoderPath: 
 --- !u!1 &9083192740923208544
 GameObject:
   m_ObjectHideFlags: 0
@@ -242,7 +228,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   voice: 3
   voicesBinPath: D:/tools/pocket-tts-web/voices.bin
-  voicesRefPath: D:/ai/sample/trump.wav
+  voicesRefPath: D:/tools/pocket-tts-web/reference_voice.wav
   encoderPath: D:/tools/pocket-tts-web/onnx/mimi_encoder.onnx
   decoderPath: D:/tools/pocket-tts-web/onnx/mimi_decoder_int8.onnx
   tokenizerPath: D:/tools/pocket-tts-web/tokenizer.model

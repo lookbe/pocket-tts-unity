@@ -2,6 +2,8 @@ using Microsoft.ML.OnnxRuntime;
 using PocketTts;
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using UnityEngine;
 
@@ -9,13 +11,12 @@ namespace PocketTTS
 {
     public class PocketTTSModel : BackgroundRunner
     {
-        public MimiDecoder decoder;
-
         [Header("Models")]
         public string tokenizerPath = string.Empty;
         public string textConditionerPath = string.Empty;
         public string flowLmMainPath = string.Empty;
         public string flowLmFlowPath = string.Empty;
+        public string decoderPath = string.Empty;
 
         public delegate void StatusChangedDelegate(ModelStatus status);
         public event StatusChangedDelegate OnStatusChanged;
@@ -48,6 +49,7 @@ namespace PocketTTS
         private InferenceSession _textConditioner;
         private InferenceSession _flowLmMain;
         private InferenceSession _flowLmFlow;
+        private InferenceSession _mimiDecoder;
         private SentencePieceWrapper _sentencePiece;
 
         #region Init / Free
@@ -72,6 +74,7 @@ namespace PocketTTS
                 _textConditioner = new InferenceSession(textConditionerPath, opt);
                 _flowLmMain = new InferenceSession(flowLmMainPath, opt);
                 _flowLmFlow = new InferenceSession(flowLmFlowPath, opt);
+                _mimiDecoder = new InferenceSession(decoderPath, opt);
 
                 PostStatus(ModelStatus.Ready);
             }
@@ -93,6 +96,9 @@ namespace PocketTTS
 
             _flowLmFlow?.Dispose();
             _flowLmFlow = null;
+
+            _mimiDecoder?.Dispose();
+            _mimiDecoder = null;
 
             _sentencePiece?.Dispose();
             _sentencePiece = null;
@@ -141,33 +147,44 @@ namespace PocketTTS
             float[] xData = new float[32];
             long[] currentLatentShape = { 1, 1, 32 };
             long[] xShape = { 1, 32 };
-            
-            // Reusable OrtValues for the inner loop
+
+            // Persistent dictionaries for inputs to avoid per-step allocations
+            Dictionary<string, OrtValue> mainInputs = null;
+            Dictionary<string, OrtValue> flowInputs = null;
+
+            // Pin buffers to create persistent OrtValue tensors
+            GCHandle latentHandle = GCHandle.Alloc(currentLatentData, GCHandleType.Pinned);
+            GCHandle xHandle = GCHandle.Alloc(xData, GCHandleType.Pinned);
+
             OrtValue currentLatent = null;
             OrtValue xTensor = null;
 
             try
             {
+                currentLatent = OrtValue.CreateTensorValueFromMemory<float>(
+                    OrtMemoryInfo.DefaultInstance, currentLatentData, currentLatentShape);
+                xTensor = OrtValue.CreateTensorValueFromMemory<float>(
+                    OrtMemoryInfo.DefaultInstance, xData, xShape);
+
                 for (int i = 0; i < DiffusionStep; i++)
                 {
                     stPairs.Add(new STPair((float)i / DiffusionStep, (float)(i + 1) / DiffusionStep));
                 }
 
                 flowState = InitFlowLmState();
-                mimiState = decoder.InitMimiDecoderState();
+                mimiState = InitMimiDecoderState();
 
                 using var emptySeq = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 0, 32 });
                 using var emptyText = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 0, 1024 });
                 using var voiceTensor = OrtValue.CreateTensorValueFromMemory<float>(
-                    OrtMemoryInfo.DefaultInstance,
-                    payload.Voice.Data,
-                    payload.Voice.Shape);
+                    OrtMemoryInfo.DefaultInstance, payload.Voice.Data, payload.Voice.Shape);
+
+                mainInputs = new Dictionary<string, OrtValue>(flowState);
+                mainInputs["sequence"] = emptySeq;
+                mainInputs["text_embeddings"] = voiceTensor;
 
                 // ---- Voice conditioning
-                using (var res = _flowLmMain.Run(
-                    new RunOptions(),
-                    TensorUtil.Merge(flowState, ("sequence", emptySeq), ("text_embeddings", voiceTensor)),
-                    _flowLmMain.OutputNames))
+                using (var res = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames))
                 {
                     TensorUtil.UpdateState(flowState, res, _flowLmMain.OutputNames);
                 }
@@ -177,7 +194,6 @@ namespace PocketTTS
                 {
                     if (cts.IsCancellationRequested) break;
 
-                    // ---- Text conditioning
                     var ids = EncodeToIds(textChunk[stringIndex]).ToArray();
                     using var tokenTensor = OrtValue.CreateTensorValueFromMemory<long>(
                         OrtMemoryInfo.DefaultInstance, ids, new long[] { 1, ids.Length });
@@ -187,12 +203,12 @@ namespace PocketTTS
                         new Dictionary<string, OrtValue> { { "token_ids", tokenTensor } },
                         _textConditioner.OutputNames);
 
-                    // Optimization: Use emptyText as a temporary to avoid extra allocation if possible,
-                    // but for text conditioning we need the actual embedding.
-                    using (var res = _flowLmMain.Run(
-                        new RunOptions(),
-                        TensorUtil.Merge(flowState, ("sequence", emptySeq), ("text_embeddings", textRes[0])),
-                        _flowLmMain.OutputNames))
+                    // Update mainInputs for text conditioning
+                    foreach (var kv in flowState) mainInputs[kv.Key] = kv.Value;
+                    mainInputs["sequence"] = emptySeq;
+                    mainInputs["text_embeddings"] = textRes[0];
+
+                    using (var res = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames))
                     {
                         TensorUtil.UpdateState(flowState, res, _flowLmMain.OutputNames);
                     }
@@ -202,24 +218,23 @@ namespace PocketTTS
                     int eosStep = -1;
                     var chunk = new List<float[]>();
 
+                    flowInputs = new Dictionary<string, OrtValue>();
+
                     for (int step = 0; step < MaxFrames; step++)
                     {
                         if (cts.IsCancellationRequested) break;
 
-                        // Reuse currentLatent OrtValue if possible (or create once per step)
-                        currentLatent = OrtValue.CreateTensorValueFromMemory<float>(
-                            OrtMemoryInfo.DefaultInstance, currentLatentData, currentLatentShape);
+                        // Zero-allocation: update mainInputs in-place
+                        foreach (var kv in flowState) mainInputs[kv.Key] = kv.Value;
+                        mainInputs["sequence"] = currentLatent;
+                        mainInputs["text_embeddings"] = emptyText;
 
-                        using var arRes = _flowLmMain.Run(
-                            new RunOptions(),
-                            TensorUtil.Merge(flowState, ("sequence", currentLatent), ("text_embeddings", emptyText)),
-                            _flowLmMain.OutputNames);
+                        using var arRes = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames);
 
                         float eos = arRes[1].GetTensorDataAsSpan<float>()[0];
                         if (eosStep < 0 && eos > EOS_THRESHOLD)
                             eosStep = step;
 
-                        // Flow Matching (LSD)
                         double std = Math.Sqrt(Temperature);
                         for (int i = 0; i < 32; i++)
                         {
@@ -231,29 +246,18 @@ namespace PocketTTS
 
                         float dt = 1.0f / DiffusionStep;
 
+                        flowInputs["c"] = arRes[0];
                         for (int j = 0; j < DiffusionStep; j++)
                         {
-                            // Create x tensor for flow run
-                            xTensor = OrtValue.CreateTensorValueFromMemory<float>(
-                                OrtMemoryInfo.DefaultInstance, xData, xShape);
+                            flowInputs["s"] = stPairs[j].S;
+                            flowInputs["t"] = stPairs[j].T;
+                            flowInputs["x"] = xTensor;
 
-                            using var flowRes = _flowLmFlow.Run(
-                                new RunOptions(),
-                                new Dictionary<string, OrtValue>
-                                {
-                                    { "c", arRes[0] },
-                                    { "s", stPairs[j].S },
-                                    { "t", stPairs[j].T },
-                                    { "x", xTensor }
-                                },
-                                _flowLmFlow.OutputNames);
+                            using var flowRes = _flowLmFlow.Run(new RunOptions(), flowInputs, _flowLmFlow.OutputNames);
 
                             var v = flowRes[0].GetTensorDataAsSpan<float>();
                             for (int k = 0; k < 32; k++)
                                 xData[k] += v[k] * dt;
-                            
-                            xTensor.Dispose();
-                            xTensor = null;
                         }
 
                         float[] finalFrame = new float[32];
@@ -262,14 +266,11 @@ namespace PocketTTS
 
                         Array.Copy(finalFrame, currentLatentData, 32);
 
-                        currentLatent.Dispose();
-                        currentLatent = null;
-
                         TensorUtil.UpdateState(flowState, arRes, _flowLmMain.OutputNames);
 
                         if (eosStep >= 0 && step >= eosStep + FRAMES_AFTER_EOS)
                         {
-                            float[] audioChunk = decoder.DecodeChunk(chunk, ref mimiState);
+                            float[] audioChunk = DecodeChunk(chunk, ref mimiState, _mimiDecoder);
                             PostResponse(audioChunk);
                             chunk.Clear();
                             break;
@@ -277,7 +278,7 @@ namespace PocketTTS
 
                         if (chunk.Count >= AudioChunkSize)
                         {
-                            float[] audioChunk = decoder.DecodeChunk(chunk, ref mimiState);
+                            float[] audioChunk = DecodeChunk(chunk, ref mimiState, _mimiDecoder);
                             PostResponse(audioChunk);
                             chunk.Clear();
                         }
@@ -294,6 +295,11 @@ namespace PocketTTS
                 stPairs.Clear();
                 currentLatent?.Dispose();
                 xTensor?.Dispose();
+
+                if (latentHandle.IsAllocated) latentHandle.Free();
+                if (xHandle.IsAllocated) xHandle.Free();
+
+                FreeDecoderResources();
 
                 TensorUtil.DisposeState(flowState);
                 TensorUtil.DisposeState(mimiState);
@@ -334,6 +340,134 @@ namespace PocketTTS
                 state[$"state_{i + 2}"] = TensorUtil.CreateInt64Tensor(0);
             }
             return state;
+        }
+
+        public Dictionary<string, OrtValue> InitMimiDecoderState()
+        {
+            var state = new Dictionary<string, OrtValue>();
+            state["state_0"] = TensorUtil.CreateBoolTensor(false);
+            state["state_1"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 512, 6 });
+            state["state_2"] = TensorUtil.CreateBoolTensor(false);
+            state["state_3"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 2 });
+            state["state_4"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 256, 6 });
+            state["state_5"] = TensorUtil.CreateBoolTensor(false);
+            state["state_6"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 256, 2 });
+            state["state_7"] = TensorUtil.CreateBoolTensor(false);
+            state["state_8"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 0 });
+            state["state_9"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 5 });
+            state["state_10"] = TensorUtil.CreateBoolTensor(false);
+            state["state_11"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 2 });
+            state["state_12"] = TensorUtil.CreateBoolTensor(false);
+            state["state_13"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 0 });
+            state["state_14"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 4 });
+            state["state_15"] = TensorUtil.CreateBoolTensor(false);
+            state["state_16"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 2 });
+            state["state_17"] = TensorUtil.CreateBoolTensor(false);
+            state["state_18"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 32, 0 });
+            state["state_19"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
+            state["state_20"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_21"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_22"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
+            state["state_23"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_24"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_25"] = TensorUtil.CreateBoolTensor(false);
+            state["state_26"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 512, 16 });
+            state["state_27"] = TensorUtil.CreateBoolTensor(false);
+            state["state_28"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 1, 6 });
+            state["state_29"] = TensorUtil.CreateBoolTensor(false);
+            state["state_30"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 2 });
+            state["state_31"] = TensorUtil.CreateBoolTensor(false);
+            state["state_32"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 32, 0 });
+            state["state_33"] = TensorUtil.CreateBoolTensor(false);
+            state["state_34"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 512, 2 });
+            state["state_35"] = TensorUtil.CreateBoolTensor(false);
+            state["state_36"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 4 });
+            state["state_37"] = TensorUtil.CreateBoolTensor(false);
+            state["state_38"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 2 });
+            state["state_39"] = TensorUtil.CreateBoolTensor(false);
+            state["state_40"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 0 });
+            state["state_41"] = TensorUtil.CreateBoolTensor(false);
+            state["state_42"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 5 });
+            state["state_43"] = TensorUtil.CreateBoolTensor(false);
+            state["state_44"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 256, 2 });
+            state["state_45"] = TensorUtil.CreateBoolTensor(false);
+            state["state_46"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 0 });
+            state["state_47"] = TensorUtil.CreateBoolTensor(false);
+            state["state_48"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 256, 6 });
+            state["state_49"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
+            state["state_50"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_51"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_52"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
+            state["state_53"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_54"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_55"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 512, 16 });
+            return state;
+        }
+
+        private float[] _decoderFlattenBuffer;
+        private GCHandle _decoderFlattenHandle;
+        private OrtValue _decoderLatentTensor;
+        private Dictionary<string, OrtValue> _decoderInputs;
+
+        private float[] DecodeChunk(List<float[]> chunk, ref Dictionary<string, OrtValue> state, InferenceSession decoder)
+        {
+            try
+            {
+                int count = chunk.Count;
+                int size = count * 32;
+
+                if (_decoderFlattenBuffer == null || _decoderFlattenBuffer.Length < size)
+                {
+                    if (_decoderFlattenHandle.IsAllocated) _decoderFlattenHandle.Free();
+                    _decoderLatentTensor?.Dispose();
+
+                    _decoderFlattenBuffer = new float[size * 2];
+                    _decoderFlattenHandle = GCHandle.Alloc(_decoderFlattenBuffer, GCHandleType.Pinned);
+                    _decoderLatentTensor = null;
+                }
+
+                if (_decoderLatentTensor == null || _decoderLatentTensor.GetTensorTypeAndShape().Shape[1] != count)
+                {
+                    _decoderLatentTensor?.Dispose();
+                    _decoderLatentTensor = OrtValue.CreateTensorValueFromMemory<float>(
+                        OrtMemoryInfo.DefaultInstance, _decoderFlattenBuffer, new long[] { 1, count, 32 });
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    Array.Copy(chunk[i], 0, _decoderFlattenBuffer, i * 32, 32);
+                }
+
+                if (_decoderInputs == null)
+                {
+                    _decoderInputs = new Dictionary<string, OrtValue>(state);
+                }
+                else
+                {
+                    foreach (var kv in state) _decoderInputs[kv.Key] = kv.Value;
+                }
+                _decoderInputs["latent"] = _decoderLatentTensor;
+
+                using var res = decoder.Run(new RunOptions(), _decoderInputs, decoder.OutputNames);
+                var audioOutput = res[0];
+                ReadOnlySpan<float> audioSpan = audioOutput.GetTensorDataAsSpan<float>();
+                TensorUtil.UpdateState(state, res, decoder.OutputNames);
+                return audioSpan.ToArray();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError(e);
+            }
+            return new float[0];
+        }
+
+        private void FreeDecoderResources()
+        {
+            if (_decoderFlattenHandle.IsAllocated) _decoderFlattenHandle.Free();
+            _decoderLatentTensor?.Dispose();
+            _decoderLatentTensor = null;
+            _decoderFlattenBuffer = null;
+            _decoderInputs = null;
         }
 
         #endregion

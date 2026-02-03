@@ -156,5 +156,18 @@ namespace PocketTTS
             };
             return opt;
         }
+
+        public static void UpdateInput(Dictionary<string, OrtValue> inputs, string name, OrtValue value)
+        {
+            inputs[name] = value;
+        }
+
+        public static void UpdateInputs(Dictionary<string, OrtValue> inputs, params (string, OrtValue)[] extra)
+        {
+            foreach (var e in extra)
+            {
+                inputs[e.Item1] = e.Item2;
+            }
+        }
     }
 }
