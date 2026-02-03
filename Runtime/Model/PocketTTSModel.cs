@@ -1,11 +1,13 @@
 using Microsoft.ML.OnnxRuntime;
 using PocketTts;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace PocketTTS
@@ -136,6 +138,13 @@ namespace PocketTTS
         const float EOS_THRESHOLD = -4f;
         const int FRAMES_AFTER_EOS = 3;
 
+        private struct SynthesisItem
+        {
+            public float[] Conditioning;
+            public float[] Noise;
+            public bool IsFinal;
+        }
+
         void RunPrompt(PromptPayload payload, CancellationToken cts)
         {
             Dictionary<string, OrtValue> flowState = null;
@@ -143,11 +152,29 @@ namespace PocketTTS
             var stPairs = new List<STPair>();
             System.Random rand = new();
 
+            // Pipelining: Synthesis Queue, Potential Buffer Pools, and Feedback
+            var synthQueue = new BlockingCollection<SynthesisItem>(new ConcurrentQueue<SynthesisItem>());
+            var latentFeedbackQueue = new BlockingCollection<float[]>(new ConcurrentQueue<float[]>());
+            var bufferPool = new ConcurrentStack<float[]>();
+            var noisePool = new ConcurrentStack<float[]>();
+            
+            Func<int, float[]> getCondBuffer = (size) => bufferPool.TryPop(out var b) && b.Length >= size ? b : new float[size];
+            Func<float[]> getNoiseBuffer = () => noisePool.TryPop(out var b) ? b : new float[32];
+            
+            Action<float[]> returnCondBuffer = (b) => bufferPool.Push(b);
+            Action<float[]> returnNoiseBuffer = (b) => noisePool.Push(b);
+
+            // Set high priority for this thread
+            Thread.CurrentThread.Priority = System.Threading.ThreadPriority.AboveNormal;
+
             // Pre-allocate buffers for inference
             float[] currentLatentData = new float[32];
             float[] xData = new float[32];
             long[] currentLatentShape = { 1, 1, 32 };
             long[] xShape = { 1, 32 };
+            
+            // Adaptive conditioning size
+            int condDim = 32; 
 
             // Pre-generate Gaussian noise for the entire sequence to avoid Box-Muller in hot loop
             int noiseCount = MaxFrames * 32; // 500 * 32
@@ -163,6 +190,7 @@ namespace PocketTTS
                     noiseBuffer[n + 1] = (float)(radius * Math.Sin(theta));
             }
             float noiseStd = (float)Math.Sqrt(Temperature);
+            for (int n = 0; n < noiseCount; n++) noiseBuffer[n] *= noiseStd;
 
             // Persistent dictionaries for inputs to avoid per-step allocations
             Dictionary<string, OrtValue> mainInputs = null;
@@ -232,12 +260,98 @@ namespace PocketTTS
                     for (int i = 0; i < 32; i++) currentLatentData[i] = float.NaN;
 
                     int eosStep = -1;
-                    var chunk = new List<float[]>();
 
                     flowInputs = new Dictionary<string, OrtValue>();
 
                     // Initialize mainInputs once with persistent dictionary structure
                     // Since UpdateState uses CloneInto, the dictionary references stay valid.
+                    // Stage 2: Synthesis Worker (Pipelined)
+                    var synthTask = Task.Run(() =>
+                    {
+                        var workerFlowInputs = new Dictionary<string, OrtValue>();
+                        float[] workerXData = new float[32];
+                        long[] workerXShape = { 1, 32 };
+                        GCHandle workerXHandle = GCHandle.Alloc(workerXData, GCHandleType.Pinned);
+                        
+                        using var workerXTensor = OrtValue.CreateTensorValueFromMemory<float>(
+                            OrtMemoryInfo.DefaultInstance, workerXData, workerXShape);
+
+                        var workerChunk = new List<float[]>();
+
+                        // Set worker to highest priority to avoid hiccups
+                        Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
+
+                        try
+                        {
+                            foreach (var item in synthQueue.GetConsumingEnumerable(cts))
+                            {
+                                if (item.IsFinal) break;
+
+                                // 1. Flow Matching
+                                Array.Copy(item.Noise, workerXData, 32);
+                                float dt = 1.0f / DiffusionStep;
+
+                                using var condTensor = OrtValue.CreateTensorValueFromMemory<float>(
+                                    OrtMemoryInfo.DefaultInstance, item.Conditioning, new long[] { 1, item.Conditioning.Length });
+
+                                workerFlowInputs["c"] = condTensor;
+                                for (int j = 0; j < DiffusionStep; j++)
+                                {
+                                    workerFlowInputs["s"] = stPairs[j].S;
+                                    workerFlowInputs["t"] = stPairs[j].T;
+                                    workerFlowInputs["x"] = workerXTensor;
+
+                                    using var flowRes = _flowLmFlow.Run(new RunOptions(), workerFlowInputs, _flowLmFlow.OutputNames);
+                                    var v = flowRes[0].GetTensorDataAsSpan<float>();
+
+                                    int k = 0;
+                                    if (Vector.IsHardwareAccelerated && (32 % Vector<float>.Count == 0))
+                                    {
+                                        int vectorSize = Vector<float>.Count;
+                                        Vector<float> dtVec = new Vector<float>(dt);
+                                        var vVectors = MemoryMarshal.Cast<float, Vector<float>>(v);
+                                        var xVectors = MemoryMarshal.Cast<float, Vector<float>>(workerXData.AsSpan());
+                                        for (int vIdx = 0; vIdx < vVectors.Length; vIdx++)
+                                            xVectors[vIdx] = xVectors[vIdx] + (vVectors[vIdx] * dtVec);
+                                        k = vVectors.Length * vectorSize;
+                                    }
+                                    for (; k < 32; k++)
+                                        workerXData[k] += v[k] * dt;
+                                }
+
+                                // Pass REFINED latent back to producer for next AR step
+                                var refinedLatent = new float[32];
+                                Array.Copy(workerXData, refinedLatent, 32);
+                                latentFeedbackQueue.Add(refinedLatent);
+
+                                // 2. Decoding
+                                workerChunk.Add(refinedLatent);
+
+                                if (workerChunk.Count >= AudioChunkSize)
+                                {
+                                    float[] audioChunk = DecodeChunk(workerChunk, ref mimiState, _mimiDecoder);
+                                    PostResponse(audioChunk);
+                                    workerChunk.Clear();
+                                }
+
+                                // Return buffers to pool
+                                returnCondBuffer(item.Conditioning);
+                                returnNoiseBuffer(item.Noise);
+                            }
+
+                            if (workerChunk.Count > 0)
+                            {
+                                float[] audioChunk = DecodeChunk(workerChunk, ref mimiState, _mimiDecoder);
+                                PostResponse(audioChunk);
+                            }
+                        }
+                        finally
+                        {
+                            workerXHandle.Free();
+                        }
+                    }, cts);
+
+                    // Stage 1: AR Generator (Producer)
                     mainInputs = new Dictionary<string, OrtValue>(flowState);
                     mainInputs["sequence"] = currentLatent;
                     mainInputs["text_embeddings"] = emptyText;
@@ -246,81 +360,44 @@ namespace PocketTTS
                     {
                         if (cts.IsCancellationRequested) break;
 
-                        // No longer need to loop flowState -> mainInputs; CloneInto in UpdateState
-                        // already updated the native memory pointed to by the OrtValues in mainInputs.
-
                         using var arRes = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames);
+
+                        var arOutputSpan = arRes[0].GetTensorDataAsSpan<float>();
+                        if (step == 0) condDim = arOutputSpan.Length;
 
                         float eos = arRes[1].GetTensorDataAsSpan<float>()[0];
                         if (eosStep < 0 && eos > EOS_THRESHOLD)
                             eosStep = step;
 
-                        // Use pre-generated noise
+                        // Package conditioning and noise, then ship to worker
+                        var synthItem = new SynthesisItem 
+                        { 
+                            Conditioning = getCondBuffer(condDim), 
+                            Noise = getNoiseBuffer(), 
+                            IsFinal = false 
+                        };
+                        
+                        arOutputSpan.CopyTo(synthItem.Conditioning);
+                        
                         int noiseIdx = step * 32;
-                        for (int i = 0; i < 32; i++)
+                        Array.Copy(noiseBuffer, noiseIdx, synthItem.Noise, 0, 32);
+
+                        synthQueue.Add(synthItem);
+
+                        // WAIT for refined latent before next AR step
+                        if (latentFeedbackQueue.TryTake(out var refined, 2000, cts))
                         {
-                            xData[i] = noiseBuffer[noiseIdx + i] * noiseStd;
+                            Array.Copy(refined, currentLatentData, 32);
                         }
-
-                        float dt = 1.0f / DiffusionStep;
-
-                        flowInputs["c"] = arRes[0];
-                        for (int j = 0; j < DiffusionStep; j++)
-                        {
-                            flowInputs["s"] = stPairs[j].S;
-                            flowInputs["t"] = stPairs[j].T;
-                            flowInputs["x"] = xTensor;
-
-                            using var flowRes = _flowLmFlow.Run(new RunOptions(), flowInputs, _flowLmFlow.OutputNames);
-
-                            var v = flowRes[0].GetTensorDataAsSpan<float>();
-                            
-                            // Vectorized integration using System.Numerics.Vector and MemoryMarshal.Cast
-                            int k = 0;
-                            if (Vector.IsHardwareAccelerated && (32 % Vector<float>.Count == 0))
-                            {
-                                int vectorSize = Vector<float>.Count;
-                                Vector<float> dtVec = new Vector<float>(dt);
-                                
-                                // Cast spans to Vector<float> for zero-allocation bitwise access
-                                var vVectors = MemoryMarshal.Cast<float, Vector<float>>(v);
-                                var xVectors = MemoryMarshal.Cast<float, Vector<float>>(xData.AsSpan());
-                                
-                                for (int vIdx = 0; vIdx < vVectors.Length; vIdx++)
-                                {
-                                    xVectors[vIdx] = xVectors[vIdx] + (vVectors[vIdx] * dtVec);
-                                }
-                                k = vVectors.Length * vectorSize;
-                            }
-                            
-                            // Fallback for remaining or non-vectorized
-                            for (; k < 32; k++)
-                                xData[k] += v[k] * dt;
-                        }
-
-                        float[] finalFrame = new float[32];
-                        Array.Copy(xData, finalFrame, 32);
-                        chunk.Add(finalFrame);
-
-                        Array.Copy(finalFrame, currentLatentData, 32);
-
-                        TensorUtil.UpdateState(flowState, arRes, _flowLmMain.OutputNames);
 
                         if (eosStep >= 0 && step >= eosStep + FRAMES_AFTER_EOS)
-                        {
-                            float[] audioChunk = DecodeChunk(chunk, ref mimiState, _mimiDecoder);
-                            PostResponse(audioChunk);
-                            chunk.Clear();
                             break;
-                        }
 
-                        if (chunk.Count >= AudioChunkSize)
-                        {
-                            float[] audioChunk = DecodeChunk(chunk, ref mimiState, _mimiDecoder);
-                            PostResponse(audioChunk);
-                            chunk.Clear();
-                        }
+                        TensorUtil.UpdateState(flowState, arRes, _flowLmMain.OutputNames);
                     }
+
+                    synthQueue.Add(new SynthesisItem { IsFinal = true });
+                    synthTask.Wait(cts);
                 }
             }
             catch (Exception e)
