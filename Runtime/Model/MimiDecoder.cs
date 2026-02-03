@@ -1,4 +1,3 @@
-using LlamaCpp;
 using Microsoft.ML.OnnxRuntime;
 using System;
 using System.Collections.Generic;
@@ -56,6 +55,8 @@ namespace PocketTTS
             try
             {
                 var opt = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+                opt.IntraOpNumThreads = 4;
+
                 _mimiDecoder = new InferenceSession(decoderPath, opt);
 
                 PostStatus(ModelStatus.Ready);

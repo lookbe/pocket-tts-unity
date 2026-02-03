@@ -1,15 +1,9 @@
-using LlamaCpp;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading;
-using Unity.VisualScripting;
 using UnityEngine;
-using UnityEngine.Windows;
-using static UnityEngine.EventSystems.EventTrigger;
 
 namespace PocketTTS
 {
@@ -61,6 +55,8 @@ namespace PocketTTS
             try
             {
                 var opt = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+                opt.IntraOpNumThreads = 4;
+
                 _mimiEncoder = new InferenceSession(encoderPath, opt);
 
                 PostStatus(ModelStatus.Ready);

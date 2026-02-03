@@ -1,4 +1,3 @@
-using LlamaCpp;
 using Microsoft.ML.OnnxRuntime;
 using PocketTts;
 using System;
@@ -69,6 +68,7 @@ namespace PocketTTS
                 _sentencePiece = new SentencePieceWrapper(tokenizerPath);
 
                 var opt = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+                opt.IntraOpNumThreads = 4;
 
                 _textConditioner = new InferenceSession(textConditionerPath, opt);
                 _flowLmMain = new InferenceSession(flowLmMainPath, opt);
