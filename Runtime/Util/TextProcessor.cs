@@ -290,79 +290,129 @@ namespace PocketTts
             return text;
         }
 
+        private static string[] SplitTextIntoSentences(string text)
+        {
+            // JS: /[^.!?]+[.!?]+|[^.!?]+$/g
+            // In C# Regex, we can use Matches.
+            var matches = Regex.Matches(text, @"[^.!?]+[.!?]+|[^.!?]+$");
+            var sentences = new List<string>();
+            foreach (Match m in matches)
+            {
+                var s = m.Value.Trim();
+                if (!string.IsNullOrEmpty(s)) sentences.Add(s);
+            }
+            return sentences.ToArray();
+        }
+
+        private static List<string> SplitTokenIdsIntoChunks(List<long> tokenIds, int maxTokens, SentencePieceWrapper sp)
+        {
+            var chunks = new List<string>();
+            for (int i = 0; i < tokenIds.Count; i += maxTokens)
+            {
+                int count = Math.Min(maxTokens, tokenIds.Count - i);
+                var chunkIds = tokenIds.GetRange(i, count);
+                var chunkText = ConvertTokensToString(sp, chunkIds);
+                if (!string.IsNullOrEmpty(chunkText)) chunks.Add(chunkText);
+            }
+            return chunks;
+        }
+
+        private static string DecodeIdsToPieceString(SentencePieceWrapper sp, List<long> ids)
+        {
+            if (ids == null || ids.Count == 0)
+                return "";
+
+            // Manually convert each ID back to its piece string using the available IdToPiece method.
+            // This array of pieces is then joined to simulate the bulk decode operation.
+            var pieces = ids.Select(id => sp.IdToPiece((int)id)).ToArray();
+
+            // SentencePiece pieces are concatenated without extra spaces at this stage.
+            return string.Join("", pieces);
+        }
+
+        private const string SPIECE_UNDERLINE = "\u2581";
+
+        private static string ConvertTokensToString(SentencePieceWrapper sp, List<long> tokens)
+        {
+            string outString = "";
+
+            if (tokens.Count > 0)
+            {
+                // FIX: Use the new helper method for the final segment
+                string final = DecodeIdsToPieceString(sp, tokens);
+                outString += final;
+            }
+
+            // Cleanup
+            outString = outString.Replace(SPIECE_UNDERLINE, " ");
+            outString = outString.TrimEnd(' ', '\n', '\r', '\t');
+
+            return outString;
+        }
+
         public static List<string> SplitIntoBestSentences(string text, SentencePieceWrapper sp)
         {
             string preparedText = PrepareText(text);
             if (string.IsNullOrEmpty(preparedText)) return new List<string>();
 
-            var pieces = sp.EncodeToPieces(preparedText);
-            var tokenIds = pieces.Select(p => sp.PieceToId(p)).ToArray();
+            var sentences = SplitTextIntoSentences(preparedText);
+            if (sentences.Length == 0) return new List<string>();
 
-            // Get end-of-sentence token IDs
-            var eosPieces = sp.EncodeToPieces(".!...?");
-            var eosSet = new HashSet<int>(eosPieces.Select(p => sp.PieceToId(p)));
-
-            // Find sentence boundaries
-            var endOfSentenceIndices = new List<int> { 0 };
-            bool previousWasEos = false;
-
-            for (int i = 0; i < tokenIds.Length; i++)
-            {
-                if (eosSet.Contains(tokenIds[i]))
-                {
-                    previousWasEos = true;
-                }
-                else
-                {
-                    if (previousWasEos)
-                    {
-                        endOfSentenceIndices.Add(i);
-                    }
-                    previousWasEos = false;
-                }
-            }
-            endOfSentenceIndices.Add(tokenIds.Length);
-
-            // Reconstruct sentences with token counts
-            var sentences = new List<(int tokens, string text)>();
-            for (int i = 0; i < endOfSentenceIndices.Count - 1; i++)
-            {
-                int start = endOfSentenceIndices[i];
-                int end = endOfSentenceIndices[i + 1];
-                var sentencePieces = pieces.GetRange(start, end - start);
-
-                // Join pieces and clean up SentencePiece space character
-                string sentenceText = string.Join("", sentencePieces).Replace("\u2581", " ").Trim();
-                sentences.Add((end - start, sentenceText));
-            }
-
-            // Merge into chunks of max 50 tokens
-            const int MAX_TOKENS = 50;
+            const int CHUNK_TARGET_TOKENS = 50;
             var chunks = new List<string>();
             string currentChunk = "";
-            int currentTokens = 0;
 
-            foreach (var (tokens, sentenceText) in sentences)
+            foreach (var sentenceText in sentences)
             {
-                if (string.IsNullOrEmpty(sentenceText)) continue;
+                var sentenceTokenIds = new List<long>();
+                // Encode
+                try
+                {
+                    var pieces = sp.EncodeToPieces(sentenceText);
+                    foreach(var p in pieces) sentenceTokenIds.Add(sp.PieceToId(p));
+                }
+                catch { continue; }
+
+                int sentenceTokens = sentenceTokenIds.Count;
+
+                if (sentenceTokens > CHUNK_TARGET_TOKENS)
+                {
+                    if (!string.IsNullOrEmpty(currentChunk))
+                    {
+                        chunks.Add(currentChunk.Trim());
+                        currentChunk = "";
+                    }
+                    var splitChunks = SplitTokenIdsIntoChunks(sentenceTokenIds, CHUNK_TARGET_TOKENS, sp);
+                    chunks.AddRange(splitChunks);
+                    continue;
+                }
 
                 if (string.IsNullOrEmpty(currentChunk))
                 {
                     currentChunk = sentenceText;
-                    currentTokens = tokens;
                     continue;
                 }
 
-                if (currentTokens + tokens > MAX_TOKENS)
+                string combined = $"{currentChunk} {sentenceText}";
+                // Measure combined tokens
+                // Optimization: roughly sum, but better to measure exact if SP behavior with spaces is complex.
+                // JS does: tokenizerProcessor.encodeIds(combined).length;
+                int combinedTokens = 0;
+                try
+                {
+                     var pieces = sp.EncodeToPieces(combined);
+                     combinedTokens = pieces.Count;
+                }
+                catch { combinedTokens = sentenceTokens + 1000; } // Fallback to force split
+
+                if (combinedTokens > CHUNK_TARGET_TOKENS)
                 {
                     chunks.Add(currentChunk.Trim());
                     currentChunk = sentenceText;
-                    currentTokens = tokens;
                 }
                 else
                 {
-                    currentChunk += " " + sentenceText;
-                    currentTokens += tokens;
+                    currentChunk = combined;
                 }
             }
 

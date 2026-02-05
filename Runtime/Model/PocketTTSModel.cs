@@ -135,10 +135,12 @@ namespace PocketTTS
         public int DiffusionStep = 10;
         public int AudioChunkSize = 12;
         public float Temperature = 0.7f;
+        public float ChunkGapSec = 0.25f; // Exposed
         public bool EnableProfiling = true;
 
         const float EOS_THRESHOLD = -4f;
         const int FRAMES_AFTER_EOS = 3;
+        const int CHUNK_TARGET_TOKENS = 50;
 
         private struct SynthesisItem
         {
@@ -242,20 +244,48 @@ namespace PocketTTS
                 using var voiceTensor = OrtValue.CreateTensorValueFromMemory<float>(
                     OrtMemoryInfo.DefaultInstance, payload.Voice.Data, payload.Voice.Shape);
 
-                mainInputs = new Dictionary<string, OrtValue>(flowState);
-                mainInputs["sequence"] = emptySeq;
-                mainInputs["text_embeddings"] = voiceTensor;
-
-                // ---- Voice conditioning
-                using (var res = _flowLmMain.Run(new RunOptions(), mainInputs, _flowLmMain.OutputNames))
+                // Helper to build/reset flow state conditioned on voice
+                Action BuildVoiceConditionedState = () =>
                 {
-                    TensorUtil.UpdateState(flowState, res, _flowLmMain.OutputNames);
-                }
+                    TensorUtil.DisposeState(flowState);
+                    flowState = InitFlowLmState();
+                    
+                    var voiceInputs = new Dictionary<string, OrtValue>(flowState);
+                    voiceInputs["sequence"] = emptySeq;
+                    voiceInputs["text_embeddings"] = voiceTensor;
+                    
+                    using (var res = _flowLmMain.Run(new RunOptions(), voiceInputs, _flowLmMain.OutputNames))
+                    {
+                        TensorUtil.UpdateState(flowState, res, _flowLmMain.OutputNames);
+                    }
+                };
+
+                // Helper to reset mimi state
+                Action ResetMimiState = () =>
+                {
+                    TensorUtil.DisposeState(mimiState);
+                    mimiState = InitMimiDecoderState();
+                    // CRITICAL: Invalidate the cached binding dictionary since the state tensors are new
+                    _decoderInputs = null;
+                };
+
+                // Initial conditioning
+                BuildVoiceConditionedState();
 
                 List<string> textChunk = TextProcessor.SplitIntoBestSentences(payload.Prompt, _sentencePiece);
                 for (int stringIndex = 0; stringIndex < textChunk.Count; stringIndex++)
                 {
                     if (cts.IsCancellationRequested) break;
+
+                    // --- State Resets ---
+                    // "RESET_FLOW_STATE_EACH_CHUNK is always true"
+                    // "RESET_MIMI_STATE_EACH_CHUNK is always true"
+                    if (stringIndex > 0)
+                    {
+                        Debug.Log("Reset");
+                        BuildVoiceConditionedState();
+                        ResetMimiState();
+                    }
 
                     var ids = EncodeToIds(textChunk[stringIndex]).ToArray();
                     using var tokenTensor = OrtValue.CreateTensorValueFromMemory<long>(
@@ -266,8 +296,9 @@ namespace PocketTTS
                         new Dictionary<string, OrtValue> { { "token_ids", tokenTensor } },
                         _textConditioner.OutputNames);
 
-                    // Update mainInputs for text conditioning
-                    foreach (var kv in flowState) mainInputs[kv.Key] = kv.Value;
+                    // Update mainInputs for text conditioning of this chunk
+                    // Re-create mainInputs from current flowState (since it might have been reset)
+                    mainInputs = new Dictionary<string, OrtValue>(flowState);
                     mainInputs["sequence"] = emptySeq;
                     mainInputs["text_embeddings"] = textRes[0];
 
@@ -276,14 +307,13 @@ namespace PocketTTS
                         TensorUtil.UpdateState(flowState, res, _flowLmMain.OutputNames);
                     }
 
+                    // Reset latent buffer for new chunk
                     for (int i = 0; i < 32; i++) currentLatentData[i] = float.NaN;
 
                     int eosStep = -1;
 
                     flowInputs = new Dictionary<string, OrtValue>();
 
-                    // Initialize mainInputs once with persistent dictionary structure
-                    // Since UpdateState uses CloneInto, the dictionary references stay valid.
                     Exception synthException = null;
                     Exception decoderException = null;
 
@@ -297,8 +327,6 @@ namespace PocketTTS
                         
                         using var workerXTensor = OrtValue.CreateTensorValueFromMemory<float>(
                             OrtMemoryInfo.DefaultInstance, workerXData, workerXShape);
-
-                        var workerChunk = new List<float[]>();
 
                         // Set worker to AboveNormal (Mimi will be Highest)
                         Thread.CurrentThread.Priority = System.Threading.ThreadPriority.AboveNormal;
@@ -486,6 +514,16 @@ namespace PocketTTS
 
                     if (synthException != null) throw synthException;
                     if (decoderException != null) throw decoderException;
+                
+                    // --- Silence Gap ---
+                    if (stringIndex < textChunk.Count - 1)
+                    {
+                        int gapSamples = (int)(24000 * ChunkGapSec);
+                        if (gapSamples > 0)
+                        {
+                            PostResponse(new float[gapSamples]);
+                        }
+                    }
                 }
             }
             catch (Exception e)
