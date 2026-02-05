@@ -358,7 +358,7 @@ namespace PocketTts
             var sentences = SplitTextIntoSentences(preparedText);
             if (sentences.Length == 0) return new List<string>();
 
-            const int CHUNK_TARGET_TOKENS = 50;
+            const int CHUNK_TARGET_TOKENS = 80;
             var chunks = new List<string>();
             string currentChunk = "";
 

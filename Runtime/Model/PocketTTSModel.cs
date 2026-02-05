@@ -140,7 +140,6 @@ namespace PocketTTS
 
         const float EOS_THRESHOLD = -4f;
         const int FRAMES_AFTER_EOS = 3;
-        const int CHUNK_TARGET_TOKENS = 50;
 
         private struct SynthesisItem
         {
@@ -427,7 +426,7 @@ namespace PocketTTS
                                         long firstFrameBirth = frameBirthTimes.TryGetValue(item.Key - (AudioChunkSize - 1), out var b) ? b : 0;
                                         long latency = now - firstFrameBirth;
 
-                                        string color = rtRatio >= 1.0f ? "cyan" : "red";
+                                        string color = rtRatio >= 1.0f ? "green" : "red";
                                         string status = rtRatio >= 1.0f ? "HEALTHY" : "LAGGING";
                                         
                                         Debug.Log($"<color={color}>[TTS RT] Ratio: {rtRatio:F2}x ({status}) | Produced: {producedMs:F0}ms | Gap: {gap}ms | Latency: {latency}ms</color>");
