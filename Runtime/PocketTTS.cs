@@ -32,6 +32,7 @@ namespace PocketTTS
         [Header("Models")]
         public string flowLmMainPath = string.Empty;
         public string flowLmFlowPath = string.Empty;
+        public string bosBeforeVoicePath = string.Empty;
 
         protected PocketTTSModel pocketTTS;
         protected PocketTTSVoices voices;
@@ -133,7 +134,7 @@ namespace PocketTTS
 
         public void InitModel()
         {
-            if (string.IsNullOrEmpty(voicesBinPath))
+            if (string.IsNullOrEmpty(voicesRefPath) || string.IsNullOrEmpty(bosBeforeVoicePath))
             {
                 return;
             }
@@ -172,6 +173,7 @@ namespace PocketTTS
             pocketTTS.textConditionerPath = textConditionerPath;
             pocketTTS.flowLmMainPath = flowLmMainPath;
             pocketTTS.flowLmFlowPath = flowLmFlowPath;
+            pocketTTS.bosBeforeVoicePath = bosBeforeVoicePath;
             pocketTTS.InitModel();
 
             encoder.encoderPath = encoderPath;

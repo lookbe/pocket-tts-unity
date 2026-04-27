@@ -42,7 +42,7 @@ namespace PocketTTS
             FreeModel();
         }
 
-        private Dictionary<string, VoiceInfo> _voices;
+        private Dictionary<string, VoiceInfo> _voices = new Dictionary<string, VoiceInfo>();
 
         public void InitModel()
         {
@@ -74,8 +74,6 @@ namespace PocketTTS
         {
             try
             {
-                _voices = ParseVoicesBin(voicesBinPath);
-
                 float[] audioData = WavReader.LoadWav(voicesRefPath);
                 _voices["custom"] = encoder.Encode(audioData);
 

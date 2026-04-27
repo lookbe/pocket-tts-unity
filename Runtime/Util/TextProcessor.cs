@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using System.Text;
 using System.Linq;
 using System.Globalization;
+using UnityEngine;
 
 namespace PocketTts
 {
@@ -369,7 +370,8 @@ namespace PocketTts
                 try
                 {
                     var pieces = sp.EncodeToPieces(sentenceText);
-                    foreach(var p in pieces) sentenceTokenIds.Add(sp.PieceToId(p));
+                    Debug.Log(string.Join(", ", pieces));
+                    foreach (var p in pieces) sentenceTokenIds.Add(sp.PieceToId(p));
                 }
                 catch { continue; }
 

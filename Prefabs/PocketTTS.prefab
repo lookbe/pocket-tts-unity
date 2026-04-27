@@ -51,10 +51,13 @@ MonoBehaviour:
   flowLmMainPath: 
   flowLmFlowPath: 
   decoderPath: 
+  bosBeforeVoicePath: 
   MaxFrames: 500
-  DiffusionStep: 8
-  AudioChunkSize: 8
+  DiffusionStep: 4
+  AudioChunkSize: 12
   Temperature: 0.7
+  ChunkGapSec: 0.25
+  EnableProfiling: 1
 --- !u!114 &1947110370508409269
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -227,11 +230,12 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   voice: 3
-  voicesBinPath: D:/tools/pocket-tts-web/voices.bin
-  voicesRefPath: D:/tools/pocket-tts-web/reference_voice.wav
-  encoderPath: D:/tools/pocket-tts-web/onnx/mimi_encoder.onnx
-  decoderPath: D:/tools/pocket-tts-web/onnx/mimi_decoder_int8.onnx
-  tokenizerPath: D:/tools/pocket-tts-web/tokenizer.model
-  textConditionerPath: D:/tools/pocket-tts-web/onnx/text_conditioner.onnx
-  flowLmMainPath: D:/tools/pocket-tts-web/onnx/flow_lm_main_int8.onnx
-  flowLmFlowPath: D:/tools/pocket-tts-web/onnx/flow_lm_flow_int8.onnx
+  voicesBinPath: 
+  voicesRefPath: D:/ai/sample/default_new.wav
+  encoderPath: D:/tools/pocket-tts-models/english/mimi_encoder.onnx
+  decoderPath: D:/tools/pocket-tts-models/english/mimi_decoder_int8.onnx
+  tokenizerPath: D:/tools/pocket-tts-models/english/tokenizer.model
+  textConditionerPath: D:/tools/pocket-tts-models/english/text_conditioner.onnx
+  flowLmMainPath: D:/tools/pocket-tts-models/english/flow_lm_main_int8.onnx
+  flowLmFlowPath: D:/tools/pocket-tts-models/english/flow_lm_flow_int8.onnx
+  bosBeforeVoicePath: D:/tools/pocket-tts-models/english/bos_before_voice.npy

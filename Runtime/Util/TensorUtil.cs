@@ -46,6 +46,14 @@ namespace PocketTTS
                         s.CopyTo(target);
                         break;
                     }
+                case TensorElementType.Float16:
+                    {
+                        var s = src.GetTensorDataAsSpan<Float16>();
+                        var d = dest.GetTensorDataAsSpan<Float16>();
+                        var target = MemoryMarshal.CreateSpan(ref MemoryMarshal.GetReference(d), d.Length);
+                        s.CopyTo(target);
+                        break;
+                    }
                 default:
                     throw new NotSupportedException($"Unsupported tensor type {srcInfo.ElementDataType}");
             }
@@ -75,6 +83,12 @@ namespace PocketTTS
                     {
                         var data = src.GetTensorDataAsSpan<bool>().ToArray();
                         return OrtValue.CreateTensorValueFromMemory<bool>(
+                            OrtMemoryInfo.DefaultInstance, data, shape);
+                    }
+                case TensorElementType.Float16:
+                    {
+                        var data = src.GetTensorDataAsSpan<Float16>().ToArray();
+                        return OrtValue.CreateTensorValueFromMemory<Float16>(
                             OrtMemoryInfo.DefaultInstance, data, shape);
                     }
                 default:
@@ -133,6 +147,13 @@ namespace PocketTTS
             long elementCount = shape.Aggregate(1L, (a, b) => b == 0 ? 0 : a * b);
             float[] buffer = new float[elementCount];
             return OrtValue.CreateTensorValueFromMemory<float>(OrtMemoryInfo.DefaultInstance, buffer, shape);
+        }
+
+        public static OrtValue CreateEmptyFloat16Tensor(long[] shape)
+        {
+            long elementCount = shape.Aggregate(1L, (a, b) => b == 0 ? 0 : a * b);
+            Float16[] buffer = new Float16[elementCount];
+            return OrtValue.CreateTensorValueFromMemory<Float16>(OrtMemoryInfo.DefaultInstance, buffer, shape);
         }
 
         public static OrtValue CreateInt64Tensor(long value)

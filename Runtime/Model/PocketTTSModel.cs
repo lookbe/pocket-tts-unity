@@ -20,6 +20,7 @@ namespace PocketTTS
         public string flowLmMainPath = string.Empty;
         public string flowLmFlowPath = string.Empty;
         public string decoderPath = string.Empty;
+        public string bosBeforeVoicePath = string.Empty;
 
         public delegate void StatusChangedDelegate(ModelStatus status);
         public event StatusChangedDelegate OnStatusChanged;
@@ -54,6 +55,8 @@ namespace PocketTTS
         private InferenceSession _flowLmFlow;
         private InferenceSession _mimiDecoder;
         private SentencePieceWrapper _sentencePiece;
+        private float[] _bosData;
+        private long[] _bosShape;
 
         #region Init / Free
 
@@ -79,6 +82,13 @@ namespace PocketTTS
                 _flowLmMain = new InferenceSession(flowLmMainPath, lightOpt);
                 _flowLmFlow = new InferenceSession(flowLmFlowPath, lightOpt);
                 _mimiDecoder = new InferenceSession(decoderPath, mimiOpt);
+
+                if (!string.IsNullOrEmpty(bosBeforeVoicePath) && System.IO.File.Exists(bosBeforeVoicePath))
+                {
+                    var bos = NpyUtil.ParseNpyFloat32(System.IO.File.ReadAllBytes(bosBeforeVoicePath));
+                    _bosData = bos.data;
+                    _bosShape = bos.shape;
+                }
 
                 PostStatus(ModelStatus.Ready);
             }
@@ -240,8 +250,17 @@ namespace PocketTTS
                 
                 using var emptySeq = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 0, 32 });
                 using var emptyText = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 0, 1024 });
+
+                float[] preppedVoiceData = payload.Voice.Data;
+                long[] preppedVoiceShape = payload.Voice.Shape;
+
+                if (_bosData != null)
+                {
+                    (preppedVoiceData, preppedVoiceShape) = PrependBosBeforeVoice(payload.Voice.Data, payload.Voice.Shape);
+                }
+
                 using var voiceTensor = OrtValue.CreateTensorValueFromMemory<float>(
-                    OrtMemoryInfo.DefaultInstance, payload.Voice.Data, payload.Voice.Shape);
+                    OrtMemoryInfo.DefaultInstance, preppedVoiceData, preppedVoiceShape);
 
                 // Helper to build/reset flow state conditioned on voice
                 Action BuildVoiceConditionedState = () =>
@@ -341,7 +360,7 @@ namespace PocketTTS
                                 float dt = 1.0f / DiffusionStep;
 
                                 using var condTensor = OrtValue.CreateTensorValueFromMemory<float>(
-                                    OrtMemoryInfo.DefaultInstance, item.Conditioning, new long[] { 1, item.Conditioning.Length });
+                                    OrtMemoryInfo.DefaultInstance, item.Conditioning, new long[] { item.Conditioning.Length });
 
                                 workerFlowInputs["c"] = condTensor;
                                 System.Diagnostics.Stopwatch flowSw = System.Diagnostics.Stopwatch.StartNew();
@@ -577,12 +596,12 @@ namespace PocketTTS
         public Dictionary<string, OrtValue> InitFlowLmState()
         {
             var state = new Dictionary<string, OrtValue>();
-            long[] kvShape = { 2, 1, 1000, 16, 64 };
+            long[] kvShape = { 1, 1000, 16, 64 };
 
-            for (int i = 0; i <= 15; i += 3)
+            for (int i = 0; i < 18; i += 3)
             {
-                state[$"state_{i}"] = TensorUtil.CreateEmptyFloatTensor(kvShape);
-                state[$"state_{i + 1}"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 0 });
+                state[$"state_{i}"] = TensorUtil.CreateEmptyFloat16Tensor(kvShape);
+                state[$"state_{i + 1}"] = TensorUtil.CreateEmptyFloat16Tensor(kvShape);
                 state[$"state_{i + 2}"] = TensorUtil.CreateInt64Tensor(0);
             }
             return state;
@@ -610,11 +629,11 @@ namespace PocketTTS
             state["state_16"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 64, 2 });
             state["state_17"] = TensorUtil.CreateBoolTensor(false);
             state["state_18"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 32, 0 });
-            state["state_19"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
-            state["state_20"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_19"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
+            state["state_20"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
             state["state_21"] = TensorUtil.CreateInt64Tensor(0);
-            state["state_22"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
-            state["state_23"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_22"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
+            state["state_23"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
             state["state_24"] = TensorUtil.CreateInt64Tensor(0);
             state["state_25"] = TensorUtil.CreateBoolTensor(false);
             state["state_26"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 512, 16 });
@@ -640,14 +659,32 @@ namespace PocketTTS
             state["state_46"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 128, 0 });
             state["state_47"] = TensorUtil.CreateBoolTensor(false);
             state["state_48"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 256, 6 });
-            state["state_49"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
-            state["state_50"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_49"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
+            state["state_50"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
             state["state_51"] = TensorUtil.CreateInt64Tensor(0);
-            state["state_52"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 2, 1, 8, 1000, 64 });
-            state["state_53"] = TensorUtil.CreateInt64Tensor(0);
+            state["state_52"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
+            state["state_53"] = TensorUtil.CreateEmptyFloat16Tensor(new long[] { 1, 250, 8, 64 });
             state["state_54"] = TensorUtil.CreateInt64Tensor(0);
             state["state_55"] = TensorUtil.CreateEmptyFloatTensor(new long[] { 1, 512, 16 });
             return state;
+        }
+
+        private (float[] data, long[] shape) PrependBosBeforeVoice(float[] voiceData, long[] voiceShape)
+        {
+            if (_bosData == null || _bosShape == null) return (voiceData, voiceShape);
+
+            // Shape: [1, frames, 1024]
+            int bosFrames = (int)_bosShape[1];
+            int voiceFrames = (int)voiceShape[1];
+            int embDim = 1024;
+
+            int outFrames = bosFrames + voiceFrames;
+            float[] output = new float[outFrames * embDim];
+
+            Array.Copy(_bosData, 0, output, 0, bosFrames * embDim);
+            Array.Copy(voiceData, 0, output, bosFrames * embDim, voiceFrames * embDim);
+
+            return (output, new long[] { 1, outFrames, embDim });
         }
 
         private float[] _decoderFlattenBuffer;
