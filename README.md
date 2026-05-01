@@ -88,7 +88,7 @@ Controlled by `AudioChunkSize`. This determines how many frames are generated be
 
 ## Requirements: Models
 
-### Choose one language from  [lookbe/pocket-tts-onnx](https://huggingface.co/lookbe/pocket-tts-onnx/tree/main) and dowload file listed below.
+### Choose one language from  [lookbe/pocket-tts-onnx-v2](https://huggingface.co/lookbe/pocket-tts-onnx-v2/tree/main) and dowload file listed below.
 * `mimi_encoder.onnx`
 * `mimi_decoder_int8.onnx`
 * `text_conditioner.onnx`
